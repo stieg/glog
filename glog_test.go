@@ -359,6 +359,7 @@ func TestRollover(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	Info("x") // create a new file
+	Flush()
 	if err != nil {
 		t.Fatalf("error after rotation: %v", err)
 	}

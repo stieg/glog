@@ -71,7 +71,6 @@
 package glog
 
 import (
-	"bufio"
 	"bytes"
 	"errors"
 	"flag"
@@ -405,6 +404,7 @@ func init() {
 
 	// Default stderrThreshold is ERROR.
 	logging.stderrThreshold = errorLog
+	logging.flushCh = make(chan struct{}, 1)
 
 	logging.setVState(0, nil, false)
 	go logging.flushDaemon()
@@ -425,6 +425,9 @@ type loggingT struct {
 
 	// Level flag. Handled atomically.
 	stderrThreshold severity // The -stderrthreshold flag.
+
+	// Used to signal the flushDaemon to flush now
+	flushCh chan struct{}
 
 	// freeList is a list of byte buffers, maintained under freeListMu.
 	freeList *buffer
@@ -795,29 +798,88 @@ func (l *loggingT) exit(err error) {
 	os.Exit(2)
 }
 
-// syncBuffer joins a bufio.Writer to its underlying file, providing access to the
-// file's Sync method and providing a wrapper for the Write method that provides log
-// file rotation. There are conflicting methods, so the file cannot be embedded.
-// l.mu is held for all its methods.
+// syncBuffer allow multiple goroutines to call Write() and not be
+// blocked on disk IO.  Disk IO is done through the Flush() and Sync()
+// calls.  A Write() call may trigger the flushDaemon to start disk
+// IO, but the Write() call will not block or wait for the result.
 type syncBuffer struct {
-	logger *loggingT
-	*bufio.Writer
+	// logger.mu protects these structures
+	//
+	// logger.mu is not held during file IO
+	//
+	// If both mu and logger.mu have to be held at the same time,
+	// then mu must be taken first
+	logger   *loggingT
+	buf      *bytes.Buffer
+	bufbytes uint64 // used to trigger flush early
+
+	// mu is held during file IO and protects a couple extra fields
+	mu     sync.Mutex
 	file   *os.File
 	sev    severity
 	nbytes uint64 // The number of bytes written to this file
 }
 
-func (sb *syncBuffer) Sync() error {
-	return sb.file.Sync()
+// This does file IO.  Will Lock the sb.mu
+func (sb *syncBuffer) Sync() (err error) {
+	sb.mu.Lock()
+	err = sb.file.Sync()
+	sb.mu.Unlock()
+	return err
 }
 
+// Write only writes to the buffer.  No file IO is performed.  Caller should lock the sb.logger.mu
 func (sb *syncBuffer) Write(p []byte) (n int, err error) {
+	if sb.buf == nil {
+		sb.buf = new(bytes.Buffer)
+	}
+	n, err = sb.buf.Write(p)
+	sb.bufbytes += uint64(n)
+
+	// Flush either when the file might need to be rotated or when
+	// the buffer gets big
+	if sb.bufbytes > MaxSize || sb.buf.Len() > 100*1024 {
+		// Non-blocking signal to the flushDaemon to start a flush
+		select {
+		case sb.logger.flushCh <- struct{}{}:
+		default:
+		}
+	}
+	return n, err
+}
+
+// Flush copies buffered contents into the file.
+// It will take the sb.mu and do disk IO
+//
+// While it is manipulating the sb.buf it will hold also sb.logger.mu.
+// It will not hold sb.logger.mu lock while doing IO
+func (sb *syncBuffer) Flush() (err error) {
+	sb.mu.Lock()
+
+	sb.logger.mu.Lock()
+	buf := sb.buf
+	sb.buf = new(bytes.Buffer)
+	sb.logger.mu.Unlock()
+
+	_, err = sb.writeFile(buf.Bytes())
+
+	sb.logger.mu.Lock()
+	sb.bufbytes = sb.nbytes + uint64(sb.buf.Len())
+	sb.logger.mu.Unlock()
+
+	sb.mu.Unlock()
+
+	return err
+}
+
+// writeFile does the actual file IO.  Caller should Lock the sb.mu
+func (sb *syncBuffer) writeFile(p []byte) (n int, err error) {
 	if sb.nbytes+uint64(len(p)) >= MaxSize {
 		if err := sb.rotateFile(time.Now()); err != nil {
 			sb.logger.exit(err)
 		}
 	}
-	n, err = sb.Writer.Write(p)
+	n, err = sb.file.Write(p)
 	sb.nbytes += uint64(n)
 	if err != nil {
 		sb.logger.exit(err)
@@ -826,9 +888,9 @@ func (sb *syncBuffer) Write(p []byte) (n int, err error) {
 }
 
 // rotateFile closes the syncBuffer's file and starts a new one.
+// Caller should Lock the sb.mu
 func (sb *syncBuffer) rotateFile(now time.Time) error {
 	if sb.file != nil {
-		sb.Flush()
 		sb.file.Close()
 	}
 	var err error
@@ -837,8 +899,6 @@ func (sb *syncBuffer) rotateFile(now time.Time) error {
 	if err != nil {
 		return err
 	}
-
-	sb.Writer = bufio.NewWriterSize(sb.file, bufferSize)
 
 	// Write header.
 	var buf bytes.Buffer
@@ -879,16 +939,29 @@ const flushInterval = 30 * time.Second
 
 // flushDaemon periodically flushes the log file buffers.
 func (l *loggingT) flushDaemon() {
-	for _ = range time.NewTicker(flushInterval).C {
-		l.lockAndFlushAll()
+	ticker := time.NewTicker(flushInterval)
+	for {
+		select {
+		case <-ticker.C:
+			l.lockAndFlushAll()
+		case <-l.flushCh:
+			l.lockAndFlushAll()
+		}
 	}
 }
 
 // lockAndFlushAll is like flushAll but locks l.mu first.
 func (l *loggingT) lockAndFlushAll() {
-	l.mu.Lock()
-	l.flushAll()
-	l.mu.Unlock()
+	// Flush from fatal down, in case there's trouble flushing.
+	for s := fatalLog; s >= infoLog; s-- {
+		l.mu.Lock()
+		file := l.file[s]
+		l.mu.Unlock()
+		if file != nil {
+			file.Flush() // ignore error
+			file.Sync()  // ignore error
+		}
+	}
 }
 
 // flushAll flushes all the logs and attempts to "sync" their data to disk.
