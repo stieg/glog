@@ -406,7 +406,9 @@ func init() {
 
 	// Default stderrThreshold is ERROR.
 	logging.stderrThreshold = errorLog
-	logging.flushCh = make(chan struct{}, 1)
+	for i := 0; i < numSeverity; i++ {
+		logging.flushCh[i] = make(chan struct{}, 1)
+	}
 
 	logging.setVState(0, nil, false)
 	go logging.flushDaemon()
@@ -428,8 +430,8 @@ type loggingT struct {
 	// Level flag. Handled atomically.
 	stderrThreshold severity // The -stderrthreshold flag.
 
-	// Used to signal the flushDaemon to flush now
-	flushCh chan struct{}
+	// Used to signal the flushDaemon to flush a particular log
+	flushCh [numSeverity]chan struct{}
 
 	// freeList is a list of byte buffers, maintained under freeListMu.
 	freeList *buffer
@@ -805,6 +807,8 @@ func (l *loggingT) exit(err error) {
 // calls.  A Write() call may trigger the flushDaemon to start disk
 // IO, but the Write() call will not block or wait for the result.
 type syncBuffer struct {
+	sev severity
+
 	// logger.mu protects these structures
 	//
 	// logger.mu is not held during file IO
@@ -818,7 +822,6 @@ type syncBuffer struct {
 	// mu is held during file IO and protects a couple extra fields
 	mu     sync.Mutex
 	file   *os.File
-	sev    severity
 	nbytes uint64 // The number of bytes written to this file
 }
 
@@ -843,7 +846,7 @@ func (sb *syncBuffer) Write(p []byte) (n int, err error) {
 	if sb.bufbytes > MaxSize || sb.buf.Len() > 100*1024 {
 		// Non-blocking signal to the flushDaemon to start a flush
 		select {
-		case sb.logger.flushCh <- struct{}{}:
+		case sb.logger.flushCh[sb.sev] <- struct{}{}:
 		default:
 		}
 	}
@@ -946,8 +949,27 @@ func (l *loggingT) flushDaemon() {
 		select {
 		case <-ticker.C:
 			l.lockAndFlushAll()
-		case <-l.flushCh:
-			l.lockAndFlushAll()
+		case <-l.flushCh[infoLog]:
+			l.lockAndFlush(infoLog)
+		case <-l.flushCh[warningLog]:
+			l.lockAndFlush(warningLog)
+		case <-l.flushCh[errorLog]:
+			l.lockAndFlush(errorLog)
+		case <-l.flushCh[fatalLog]:
+			l.lockAndFlush(fatalLog)
+		}
+	}
+}
+
+// lockAndFlush flushes (but does not sync) the log for a single severity level.
+func (l *loggingT) lockAndFlush(s severity) {
+	// Flush from fatal down, in case there's trouble flushing.
+	for s := fatalLog; s >= infoLog; s-- {
+		l.mu.Lock()
+		file := l.file[s]
+		l.mu.Unlock()
+		if file != nil {
+			file.Flush() // ignore error
 		}
 	}
 }
