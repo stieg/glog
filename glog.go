@@ -799,7 +799,7 @@ func (l *loggingT) exit(err error) {
 		return
 	}
 	l.flushAll()
-	os.Exit(2)
+	//os.Exit(2)
 }
 
 // syncBuffer allow multiple goroutines to call Write() and not be
