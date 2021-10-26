@@ -115,6 +115,10 @@ var severityName = []string{
 	fatalLog:   "FATAL",
 }
 
+// maxStdErrBufCap is the limit we arbitrarily set to gc large std error buffers if they grow too large
+// the buffers are stdErrTempBuffer1 and stdErrTempBuffer2
+var maxStdErrBufCap int = 10 * 1024 * 1024
+
 // get returns the value of the severity.
 func (s *severity) get() severity {
 	return severity(atomic.LoadInt32((*int32)(s)))
@@ -412,6 +416,7 @@ func init() {
 
 	logging.setVState(0, nil, false)
 	go logging.flushDaemon()
+	go logging.outputStdErrLoop()
 }
 
 // Flush flushes all pending log I/O.
@@ -460,6 +465,18 @@ type loggingT struct {
 	// safely using atomic.LoadInt32.
 	vmodule   moduleSpec // The state of the -vmodule flag.
 	verbosity Level      // V logging level, the value of the -v flag/
+
+	// stdErrTempBuffer1 and stdErrTempBuffer2 are used as a intermediary storage prior to writing to stderr
+	// at any moment, one will be available to consume logs written from output whilst the other writes to stderr
+	stdErrTempBuffer1 bytes.Buffer
+	// stdErrTempBuffer2 secondary buffer, see stdErrTempBuffer1 documentation
+	stdErrTempBuffer2 bytes.Buffer
+	// currStdErrTmpBuffer points to either stdErrTempBuffer1 or stdErrTempBuffer2
+	// it signifies the current buffer output is writing to
+	// it implies that the other buffer could be writing to stderr
+	currStdErrTmpBuffer *bytes.Buffer
+	// stdErrWriterCh used to notify outputStdErrLoop which buffer to write to stderr
+	stdErrWriterCh chan *bytes.Buffer
 }
 
 // buffer holds a byte Buffer for reuse. The zero value is ready for use.
@@ -674,6 +691,38 @@ func (l *loggingT) printWithFileLine(s severity, file string, line int, alsoToSt
 	l.output(s, buf, file, line, alsoToStderr)
 }
 
+// initializeStdErrFixtures sets up the stdErrWriterCh and currStdErrTmpBuffer
+// this is due to both the outputStdErrLoop and output requiring it
+// caller must hold mu
+func (l *loggingT) initializeStdErrFixtures() {
+	if l.currStdErrTmpBuffer == nil {
+		l.currStdErrTmpBuffer = &l.stdErrTempBuffer1
+	}
+	if l.stdErrWriterCh == nil {
+		l.stdErrWriterCh = make(chan *bytes.Buffer)
+	}
+}
+
+// outputStdErrLoop is used for writing logs to stderr without blocking output
+func (l *loggingT) outputStdErrLoop() {
+	l.mu.Lock()
+	l.initializeStdErrFixtures()
+	l.mu.Unlock()
+	for {
+		buf := <-l.stdErrWriterCh
+		_, err := buf.WriteTo(os.Stderr)
+		if err != nil {
+			l.print(errorLog, fmt.Sprintf("GLOG: unable to write buffer to stderr: %s", err))
+		}
+		if size := buf.Cap(); size > maxStdErrBufCap {
+			l.print(errorLog, fmt.Sprintf("GLOG: Dropped buffer, capacity %d exceeds maxStdErrBufCap %d", size, maxStdErrBufCap))
+			*buf = bytes.Buffer{}
+		} else {
+			buf.Reset()
+		}
+	}
+}
+
 // output writes the data to the log files and releases the buffer.
 func (l *loggingT) output(s severity, buf *buffer, file string, line int, alsoToStderr bool) {
 	l.mu.Lock()
@@ -687,7 +736,28 @@ func (l *loggingT) output(s severity, buf *buffer, file string, line int, alsoTo
 		os.Stderr.Write([]byte("ERROR: logging before flag.Parse: "))
 		os.Stderr.Write(data)
 	} else if l.toStderr {
-		os.Stderr.Write(data)
+		l.initializeStdErrFixtures()
+		if size := l.currStdErrTmpBuffer.Len(); size > maxStdErrBufCap {
+			*l.currStdErrTmpBuffer = bytes.Buffer{}
+			l.currStdErrTmpBuffer.WriteString(fmt.Sprintf("GLOG: Dropped buffer, current size %d exceeds maxStdErrBufCap %d\n", size, maxStdErrBufCap))
+		}
+		if _, err := buf.WriteTo(l.currStdErrTmpBuffer); err != nil {
+			l.currStdErrTmpBuffer.WriteString(fmt.Sprintf("GLOG: Unable to write to currStdErrTmpBuffer from output buf %s\n", err))
+		}
+
+		// we always attempt to write to stdErrWriterCh to write to stderr in a non-blocking way
+		// when we do, we swap out one of the buffers for another
+		// otherwise we'll continue using the current buffer until writing to stderr is completed
+		// if for some reason stdErrWriterCh is never available, we capped the buffers above to maxStdErrBufCap
+		select {
+		case l.stdErrWriterCh <- l.currStdErrTmpBuffer:
+			if l.currStdErrTmpBuffer == &l.stdErrTempBuffer1 {
+				l.currStdErrTmpBuffer = &l.stdErrTempBuffer2
+			} else {
+				l.currStdErrTmpBuffer = &l.stdErrTempBuffer1
+			}
+		default:
+		}
 	} else {
 		if alsoToStderr || l.alsoToStderr || s >= l.stderrThreshold.get() {
 			os.Stderr.Write(data)
