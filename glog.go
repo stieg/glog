@@ -407,6 +407,7 @@ func init() {
 	flag.Var(&logging.stderrThreshold, "stderrthreshold", "logs at or above this threshold go to stderr")
 	flag.Var(&logging.vmodule, "vmodule", "comma-separated list of pattern=N settings for file-filtered logging")
 	flag.Var(&logging.traceLocation, "log_backtrace_at", "when logging hits line file:N, emit a stack trace")
+	flag.UintVar(&logging.dedupeAfter, "logdedupeafter", 0, "Will de-duplicate the same log statement after N consecutive repititions")
 
 	// Default stderrThreshold is ERROR.
 	logging.stderrThreshold = errorLog
@@ -434,6 +435,10 @@ type loggingT struct {
 
 	// Level flag. Handled atomically.
 	stderrThreshold severity // The -stderrthreshold flag.
+
+	// Determines when the log deduplication code will kick in. Disabled
+	// when value is 0.
+	dedupeAfter uint
 
 	// Used to signal the flushDaemon to flush a particular log
 	flushCh [numSeverity]chan struct{}
@@ -477,6 +482,13 @@ type loggingT struct {
 	currStdErrTmpBuffer *bytes.Buffer
 	// stdErrWriterCh used to notify outputStdErrLoop which buffer to write to stderr
 	stdErrWriterCh chan *bytes.Buffer
+
+	// lastStatement* tracks who our last log message came from and how many we
+	// have since consecutively received from this caller.
+	lastStatementMu       sync.Mutex
+	lastStatementCaller   caller
+	lastStatementSeverity severity
+	lastStatementCount    uint
 }
 
 // buffer holds a byte Buffer for reuse. The zero value is ready for use.
@@ -537,6 +549,89 @@ func (l *loggingT) putBuffer(b *buffer) {
 	l.freeListMu.Unlock()
 }
 
+// caller is a simple structure that tracks the output of runtime.Caller. It is
+// done this way to make function calls easier.
+type caller struct {
+	pc   uintptr
+	file string
+	line int
+}
+
+// getCaller returns runtime information about the caller of this function. This
+// data is used while printing log lines along with de-duplicating noisy log
+// statements. It is the same logic as before, just liberated into its own
+// function with the caller struct used to track the info.
+func getCaller(depth int) caller {
+	pc, file, line, ok := runtime.Caller(3 + depth)
+
+	if !ok {
+		pc = 0
+		file = "???"
+		line = 0
+	} else {
+		slash := strings.LastIndex(file, "/")
+		if slash >= 0 {
+			file = file[slash+1:]
+		}
+		// Unsure if needed, but since this was in code previously I am carrying it
+		// forward here to avoid any surprise regressions. Original comment:
+		//
+		// not a real line number, but acceptable to someDigits
+		if line < 0 {
+			line = 0
+		}
+	}
+
+	return caller{
+		pc:   pc,
+		file: file,
+		line: line,
+	}
+}
+
+// dedupe determines whether or not we need to de-duplicate a log
+// message. Method will return true if we do, false otherwise. Method is also
+// responsible for noticing a different logging statement is being called and
+// adding any relevant de-duplication log information about our previously
+// de-duped log statements. As such IT MUST BE CALLED AS PART OF EVERY LOG
+// STATEMENT in order to be effective.
+func (l *loggingT) dedupe(s severity, c caller) bool {
+	// Deduplication of logs is disabled if 0
+	dedupeAfter := l.dedupeAfter
+	if dedupeAfter == 0 {
+		return false
+	}
+
+	// Ensure lock is not held during any potential logging events to keep
+	// function performant. Thus we must not use a defer unlock here.
+	l.lastStatementMu.Lock()
+
+	if l.lastStatementCaller.pc == c.pc {
+		l.lastStatementCount++
+		skip := l.lastStatementCount > dedupeAfter
+		l.lastStatementMu.Unlock()
+		return skip
+	}
+
+	prevCount := l.lastStatementCount
+	prevCaller := l.lastStatementCaller
+	prevSeverity := l.lastStatementSeverity
+	l.lastStatementCaller = c
+	l.lastStatementSeverity = s
+	l.lastStatementCount = 1
+	l.lastStatementMu.Unlock()
+
+	// Check if we deduplicated the previous message, and include de-dupe info
+	// before allowing the next log message to proceed.
+	if prevCount > dedupeAfter {
+		buf := l.header(prevSeverity, prevCaller)
+		fmt.Fprintf(buf, "...statement repeated %d time(s)...\n", prevCount-dedupeAfter)
+		l.output(prevSeverity, buf, prevCaller, false)
+	}
+
+	return false
+}
+
 var timeNow = time.Now // Stubbed out for testing.
 
 /*
@@ -556,26 +651,8 @@ where the fields are defined as follows:
 	line             The line number
 	msg              The user-supplied message
 */
-func (l *loggingT) header(s severity, depth int) (*buffer, string, int) {
-	_, file, line, ok := runtime.Caller(3 + depth)
-	if !ok {
-		file = "???"
-		line = 1
-	} else {
-		slash := strings.LastIndex(file, "/")
-		if slash >= 0 {
-			file = file[slash+1:]
-		}
-	}
-	return l.formatHeader(s, file, line), file, line
-}
-
-// formatHeader formats a log header using the provided file name and line number.
-func (l *loggingT) formatHeader(s severity, file string, line int) *buffer {
+func (l *loggingT) header(s severity, c caller) *buffer {
 	now := timeNow()
-	if line < 0 {
-		line = 0 // not a real line number, but acceptable to someDigits
-	}
 	if s > fatalLog {
 		s = infoLog // for safety.
 	}
@@ -601,9 +678,9 @@ func (l *loggingT) formatHeader(s severity, file string, line int) *buffer {
 	buf.nDigits(7, 22, pid, ' ') // TODO: should be TID
 	buf.tmp[29] = ' '
 	buf.Write(buf.tmp[:30])
-	buf.WriteString(file)
+	buf.WriteString(c.file)
 	buf.tmp[0] = ':'
-	n := buf.someDigits(1, line)
+	n := buf.someDigits(1, c.line)
 	buf.tmp[n+1] = ']'
 	buf.tmp[n+2] = ' '
 	buf.Write(buf.tmp[:n+3])
@@ -652,9 +729,14 @@ func (buf *buffer) someDigits(i, d int) int {
 }
 
 func (l *loggingT) println(s severity, args ...interface{}) {
-	buf, file, line := l.header(s, 0)
+	c := getCaller(0)
+	skip := l.dedupe(s, c)
+	if skip {
+		return
+	}
+	buf := l.header(s, c)
 	fmt.Fprintln(buf, args...)
-	l.output(s, buf, file, line, false)
+	l.output(s, buf, c, false)
 }
 
 func (l *loggingT) print(s severity, args ...interface{}) {
@@ -662,33 +744,47 @@ func (l *loggingT) print(s severity, args ...interface{}) {
 }
 
 func (l *loggingT) printDepth(s severity, depth int, args ...interface{}) {
-	buf, file, line := l.header(s, depth)
+	c := getCaller(depth)
+	skip := l.dedupe(s, c)
+	if skip {
+		return
+	}
+	buf := l.header(s, c)
 	fmt.Fprint(buf, args...)
 	if buf.Bytes()[buf.Len()-1] != '\n' {
 		buf.WriteByte('\n')
 	}
-	l.output(s, buf, file, line, false)
+	l.output(s, buf, c, false)
 }
 
 func (l *loggingT) printf(s severity, format string, args ...interface{}) {
-	buf, file, line := l.header(s, 0)
+	c := getCaller(0)
+	skip := l.dedupe(s, c)
+	if skip {
+		return
+	}
+	buf := l.header(s, c)
 	fmt.Fprintf(buf, format, args...)
 	if buf.Bytes()[buf.Len()-1] != '\n' {
 		buf.WriteByte('\n')
 	}
-	l.output(s, buf, file, line, false)
+	l.output(s, buf, c, false)
 }
 
 // printWithFileLine behaves like print but uses the provided file and line number.  If
 // alsoLogToStderr is true, the log message always appears on standard error; it
 // will also appear in the log file unless --logtostderr is set.
 func (l *loggingT) printWithFileLine(s severity, file string, line int, alsoToStderr bool, args ...interface{}) {
-	buf := l.formatHeader(s, file, line)
+	c := caller{
+		file: file,
+		line: line,
+	}
+	buf := l.header(s, c)
 	fmt.Fprint(buf, args...)
 	if buf.Bytes()[buf.Len()-1] != '\n' {
 		buf.WriteByte('\n')
 	}
-	l.output(s, buf, file, line, alsoToStderr)
+	l.output(s, buf, c, alsoToStderr)
 }
 
 // initializeStdErrFixtures sets up the stdErrWriterCh and currStdErrTmpBuffer
@@ -724,10 +820,10 @@ func (l *loggingT) outputStdErrLoop() {
 }
 
 // output writes the data to the log files and releases the buffer.
-func (l *loggingT) output(s severity, buf *buffer, file string, line int, alsoToStderr bool) {
+func (l *loggingT) output(s severity, buf *buffer, c caller, alsoToStderr bool) {
 	l.mu.Lock()
 	if l.traceLocation.isSet() {
-		if l.traceLocation.match(file, line) {
+		if l.traceLocation.match(c.file, c.line) {
 			buf.Write(stacks(false))
 		}
 	}

@@ -409,8 +409,60 @@ func TestLogBacktraceAt(t *testing.T) {
 }
 
 func BenchmarkHeader(b *testing.B) {
+	c := caller{}
 	for i := 0; i < b.N; i++ {
-		buf, _, _ := logging.header(infoLog, 0)
+		buf := logging.header(infoLog, c)
 		logging.putBuffer(buf)
+	}
+}
+
+// Test that De-duplication of log lines works as intended
+func TestDedupe(t *testing.T) {
+	dupeLogStatements := 4
+
+	for i := 0; i < 6; i++ {
+		var tName string
+		var expLines int
+		var expStatement string
+
+		switch {
+		case i <= 0:
+			tName = "Dedupe disabled (0)"
+			expLines = dupeLogStatements + 1
+		case i < dupeLogStatements:
+			tName = fmt.Sprintf("Dedupe after %d", i)
+			expLines = i + 2
+			expStatement = fmt.Sprintf("statement repeated %d time(s)", dupeLogStatements-i)
+		case i >= dupeLogStatements:
+			tName = fmt.Sprintf("Dedupe after %d (none expected)", i)
+			expLines = dupeLogStatements + 1
+		}
+
+		t.Run(tName, func(t *testing.T) {
+			setFlags()
+			defer logging.swap(logging.newBuffers())
+
+			logging.dedupeAfter = uint(i)
+
+			// Info log must be exact same spot in PC for test to work.
+			for j := 0; j < dupeLogStatements; j++ {
+				Info("test")
+			}
+			Info("done")
+
+			// Expect dedupeAfter lines + 2. One for the dedupe line, one for the second
+			// Info line.
+			cont := contents(infoLog)
+			t.Log(cont)
+			msgs := strings.Split(strings.TrimSuffix(cont, "\n"), "\n")
+			if len(msgs) != expLines {
+				t.Fatalf("Got %d lines, expected %d", len(msgs), expLines)
+			}
+
+			// If we expected deduplication to happen, ensure our statement is there.
+			if expStatement != "" && !contains(infoLog, expStatement, t) {
+				t.Errorf("Expected statement %q not found", expStatement)
+			}
+		})
 	}
 }
